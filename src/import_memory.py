@@ -29,7 +29,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from utils import clean_llm_json, count_tokens_approx, now_iso
+from utils import clean_llm_json, count_tokens_approx, now_iso, get_ai_name
 
 logger = logging.getLogger("ombre_brain.import")
 
@@ -274,12 +274,14 @@ def detect_and_parse(raw_content: str, filename: str = "") -> list[dict]:
 # 分窗 — 按对话轮次边界切为 ~10k token 窗口
 # ============================================================
 
-def chunk_turns(turns: list[dict], target_tokens: int = _CHUNK_TARGET_TOKENS, human_label: str = "用户") -> list[dict]:
+def chunk_turns(turns: list[dict], target_tokens: int = _CHUNK_TARGET_TOKENS, human_label: str = "用户", ai_label: str = "AI") -> list[dict]:
     """
     Group conversation turns into chunks of ~target_tokens.
     Returns list of {content, timestamp_start, timestamp_end, turn_count}.
     按对话轮次边界将对话分为 ~target_tokens 大小的窗口。
     human_label：对话中「用户」那一侧的称呼，默认「用户」，可传入 config["human"] 使内容更个人化。
+    ai_label：AI 那一侧的称呼，默认「AI」，可传入 config["ai_name"]。
+    每行格式：[YYYY-MM-DD HH:MM] 说话人：内容，含时间戳时供 LLM 归因用。
     """
     chunks: list[dict] = []
     current_lines: list[str] = []
@@ -289,8 +291,11 @@ def chunk_turns(turns: list[dict], target_tokens: int = _CHUNK_TARGET_TOKENS, hu
     turn_count = 0
 
     for turn in turns:
-        role_label = human_label if turn["role"] in ("user", "human") else "AI"
-        line = f"[{role_label}] {turn['content']}"
+        role_label = human_label if turn["role"] in ("user", "human") else ai_label
+        ts_raw = turn.get("timestamp", "")
+        ts_short = (ts_raw[:10] + " " + ts_raw[11:16]) if len(ts_raw) >= 16 else ""
+        prefix = f"[{ts_short}] " if ts_short else ""
+        line = f"{prefix}{role_label}：{turn['content']}"
         line_tokens = count_tokens_approx(line)
 
         # If single turn exceeds target, split it
@@ -516,12 +521,21 @@ class ImportState:
 
 IMPORT_EXTRACT_PROMPT = """你是一个对话记忆提取专家。从以下对话片段中提取值得长期记住的信息。
 
+【对话归因规则——最高优先级】
+输入是对话记录，每条消息格式为"[YYYY-MM-DD HH:MM] 说话人：内容"。
+(1) 所有总结使用第三人称，主语直接写说话人的名字（{HUMAN} 或 {AI}），
+    禁止使用"我"和"用户"作为主语；
+(2) 严格按照每条消息行首的说话人前缀归因，绝对不能把
+    一方说的话、属性或人设记到另一方名下；
+(3) content 和 name 中必须包含事件发生日期，日期取自
+    消息行首的 [YYYY-MM-DD HH:MM] 时间戳，禁止使用当前时间或入库时间。
+
 提取规则：
-1. 提取用户的事实、偏好、习惯、重要事件、情感时刻
+1. 提取{HUMAN}的事实、偏好、习惯、重要事件、情感时刻
 2. 同一话题的零散信息整合为一条记忆
 3. 过滤掉纯技术调试输出、代码块、重复问答、无意义寒暄
 4. 如果对话中有特殊暗号、仪式性行为、关键承诺等，标记 preserve_raw=true
-5. 如果内容是用户和我之间的习惯性互动模式（例如打招呼方式、告别习惯），标记 is_pattern=true
+5. 如果内容是{HUMAN}和{AI}之间的习惯性互动模式（例如打招呼方式、告别习惯），标记 is_pattern=true
 6. 每条记忆不少于30字
 7. 总条目数控制在 0~5 个（没有值得记的就返回空数组）
 8. 在 content 中对人名、地名、专有名词用 [[双链]] 标记
@@ -625,7 +639,7 @@ class ImportEngine:
                     # Re-parse and re-chunk to get the same chunks
                     turns = detect_and_parse(raw_content, filename)
                     _human = self.config.get("human", "用户")
-                    self._chunks = chunk_turns(turns, human_label=_human)
+                    self._chunks = chunk_turns(turns, human_label=_human, ai_label=get_ai_name())
                     self.state.data["status"] = "running"
                     self.state.save()
                     return await self._process_chunks(preserve_raw)
@@ -639,7 +653,7 @@ class ImportEngine:
                 return {"error": "No conversation turns found in file"}
 
             _human = self.config.get("human", "用户")
-            self._chunks = chunk_turns(turns, human_label=_human)
+            self._chunks = chunk_turns(turns, human_label=_human, ai_label=get_ai_name())
             if not self._chunks:
                 self._running = False
                 return {"error": "No processable chunks after splitting"}
@@ -753,9 +767,10 @@ class ImportEngine:
         if not self.dehydrator.api_available:
             raise RuntimeError("API not available")
 
-        # 用 human 配置替换 prompt 里的「用户」称呼，让 LLM 输出更个人化。
-        _human = self.config.get("human", "用户")
-        prompt = IMPORT_EXTRACT_PROMPT.replace("用户", _human) if _human != "用户" else IMPORT_EXTRACT_PROMPT
+        # 用 human / ai_name 配置替换 prompt 占位符，让 LLM 按真实名字归因。
+        _human = self.config.get("human", "用户") or "用户"
+        _ai = get_ai_name()
+        prompt = IMPORT_EXTRACT_PROMPT.replace("{HUMAN}", _human).replace("{AI}", _ai)
 
         raw = await self.dehydrator._chat(
             prompt,
